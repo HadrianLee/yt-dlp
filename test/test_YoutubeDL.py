@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import contextlib
 import copy
 import json
+import threading
 
 from test.helper import FakeYDL, assertRegexpMatches, try_rm
 from yt_dlp import YoutubeDL
@@ -950,6 +951,56 @@ class TestYoutubeDL(unittest.TestCase):
             try_rm(filename)
             try_rm(f'{filename}.done')
             try_rm(archive)
+
+    def test_postprocess_pipeline_interrupt_discards_queued_work(self):
+        processed = []
+        started = threading.Event()
+        release = threading.Event()
+
+        class PipelinePP(PostProcessor):
+            def run(self, info):
+                processed.append(info['id'])
+                if info['id'] == 'running':
+                    started.set()
+                    release.wait(1)
+                return [], info
+
+        ydl = YoutubeDL({
+            'quiet': True,
+            'postprocess_pipeline_workers': 1,
+        })
+        ydl.add_post_processor(PipelinePP())
+
+        ydl._enqueue_pipeline_post_process('running-test.mp4', {'id': 'running'}, {})
+        self.assertTrue(started.wait(1))
+
+        event = ydl._enqueue_pipeline_post_process('queued-test.mp4', {'id': 'queued'}, {})
+        ydl._abort_postprocess_pipeline()
+
+        self.assertNotIn('queued', processed)
+        self.assertTrue(event.is_set())
+        self.assertEqual(event.error, 'Interrupted by user')
+        release.set()
+        ydl._abort_postprocess_pipeline(timeout=1)
+
+    def test_postprocess_pipeline_interrupt_unblocks_after_video(self):
+        ydl = YoutubeDL({
+            'quiet': True,
+            'postprocess_pipeline_workers': 1,
+        })
+        event = threading.Event()
+        event.error = None
+
+        ydl._enqueue_pipeline_after_video({
+            'id': 'abc',
+            'extractor': 'test',
+            'requested_downloads': [{'__write_download_archive': 'ignore'}],
+        }, [event])
+
+        ydl._abort_postprocess_pipeline(timeout=1)
+
+        self.assertTrue(ydl._postprocess_pipeline_abort.is_set())
+        self.assertFalse(any(thread.is_alive() for thread in ydl._postprocess_pipeline_threads))
 
     def test_match_filter(self):
         first = {

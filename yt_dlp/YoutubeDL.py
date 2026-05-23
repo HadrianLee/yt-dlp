@@ -656,6 +656,7 @@ class YoutubeDL:
         self._postprocess_pipeline_threads = []
         self._postprocess_pipeline_sentinel = object()
         self._postprocess_pipeline_lock = threading.Lock()
+        self._postprocess_pipeline_abort = threading.Event()
         self.cache = Cache(self)
         self.__header_cookies = []
 
@@ -1053,9 +1054,11 @@ class YoutubeDL:
         if self.params.get('cookiefile') is not None:
             self.cookiejar.save()
 
-    def __exit__(self, *args):
+    def __exit__(self, exc_type, *args):
         self.restore_console_title()
         self.to_console_title(progress_state=_ProgressState.HIDDEN)
+        if exc_type is KeyboardInterrupt:
+            self._abort_postprocess_pipeline()
         self.close()
 
     def close(self):
@@ -3687,11 +3690,15 @@ class YoutubeDL:
                 and self.params.get('max_downloads') != 1):
             raise SameFileError(outtmpl)
 
-        for url in url_list:
-            self.__download_wrapper(self.extract_info)(
-                url, force_generic_extractor=self.params.get('force_generic_extractor', False))
-
-        self.wait_postprocess_pipeline()
+        try:
+            for url in url_list:
+                self.__download_wrapper(self.extract_info)(
+                    url, force_generic_extractor=self.params.get('force_generic_extractor', False))
+        except KeyboardInterrupt:
+            self._abort_postprocess_pipeline()
+            raise
+        else:
+            self.wait_postprocess_pipeline()
         return self._download_retcode
 
     def download_with_info_file(self, info_filename):
@@ -3701,20 +3708,25 @@ class YoutubeDL:
             # FileInput doesn't have a read method, we can't call json.load
             infos = [self.sanitize_info(info, self.params.get('clean_infojson', True))
                      for info in variadic(json.loads('\n'.join(f)))]
-        for info in infos:
-            try:
-                self.__download_wrapper(self.process_ie_result)(info, download=True)
-            except (DownloadError, EntryNotInPlaylist, ReExtractInfo) as e:
-                if not isinstance(e, EntryNotInPlaylist):
-                    self.to_stderr('\r')
-                webpage_url = info.get('webpage_url')
-                if webpage_url is None:
-                    raise
-                self.report_warning(f'The info failed to download: {e}; trying with URL {webpage_url}')
-                self.download([webpage_url])
-            except ExtractorError as e:
-                self.report_error(e)
-        self.wait_postprocess_pipeline()
+        try:
+            for info in infos:
+                try:
+                    self.__download_wrapper(self.process_ie_result)(info, download=True)
+                except (DownloadError, EntryNotInPlaylist, ReExtractInfo) as e:
+                    if not isinstance(e, EntryNotInPlaylist):
+                        self.to_stderr('\r')
+                    webpage_url = info.get('webpage_url')
+                    if webpage_url is None:
+                        raise
+                    self.report_warning(f'The info failed to download: {e}; trying with URL {webpage_url}')
+                    self.download([webpage_url])
+                except ExtractorError as e:
+                    self.report_error(e)
+        except KeyboardInterrupt:
+            self._abort_postprocess_pipeline()
+            raise
+        else:
+            self.wait_postprocess_pipeline()
         return self._download_retcode
 
     @staticmethod
@@ -3789,6 +3801,7 @@ class YoutubeDL:
     def _ensure_postprocess_pipeline(self):
         if self._postprocess_pipeline_threads:
             return
+        self._postprocess_pipeline_abort.clear()
         self._postprocess_pipeline_queue = queue.Queue()
         worker_count = self.params.get('postprocess_pipeline_workers') or 0
         for index in range(worker_count):
@@ -3805,6 +3818,9 @@ class YoutubeDL:
             try:
                 if item is self._postprocess_pipeline_sentinel:
                     return
+                if self._postprocess_pipeline_abort.is_set():
+                    self._discard_pipeline_item(item)
+                    continue
                 item_type, *args = item
                 if item_type == 'post_process':
                     self._run_pipeline_post_process(*args)
@@ -3833,7 +3849,9 @@ class YoutubeDL:
 
     def _run_pipeline_after_video(self, events, info):
         for event in events:
-            event.wait()
+            while not event.wait(0.1):
+                if self._postprocess_pipeline_abort.is_set():
+                    return
         if any(getattr(event, 'error', None) for event in events):
             return
 
@@ -3869,6 +3887,9 @@ class YoutubeDL:
     def wait_postprocess_pipeline(self):
         if not self._postprocess_pipeline_threads:
             return
+        if self._postprocess_pipeline_abort.is_set():
+            self._abort_postprocess_pipeline()
+            return
         self._postprocess_pipeline_queue.join()
         for _ in self._postprocess_pipeline_threads:
             self._postprocess_pipeline_queue.put(self._postprocess_pipeline_sentinel)
@@ -3876,6 +3897,47 @@ class YoutubeDL:
             thread.join()
         self._postprocess_pipeline_threads.clear()
         self._postprocess_pipeline_queue = None
+
+    def _discard_pipeline_item(self, item):
+        if item is self._postprocess_pipeline_sentinel:
+            return
+        item_type, *args = item
+        if item_type == 'post_process':
+            event = args[0]
+            event.error = 'Interrupted by user'
+            event.set()
+        elif item_type == 'after_video':
+            for event in args[0]:
+                event.error = 'Interrupted by user'
+                event.set()
+
+    def _abort_postprocess_pipeline(self, *, timeout=0):
+        pipeline_queue = self._postprocess_pipeline_queue
+        threads = self._postprocess_pipeline_threads
+        if not threads or pipeline_queue is None:
+            return
+
+        already_aborting = self._postprocess_pipeline_abort.is_set()
+        self._postprocess_pipeline_abort.set()
+
+        if not already_aborting:
+            while True:
+                try:
+                    item = pipeline_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self._discard_pipeline_item(item)
+                finally:
+                    pipeline_queue.task_done()
+            for _ in threads:
+                pipeline_queue.put(self._postprocess_pipeline_sentinel)
+
+        for thread in threads:
+            thread.join(timeout)
+        if not any(thread.is_alive() for thread in threads):
+            self._postprocess_pipeline_threads.clear()
+            self._postprocess_pipeline_queue = None
 
     def run_pp(self, pp, infodict):
         files_to_delete = []
