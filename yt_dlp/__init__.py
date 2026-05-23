@@ -217,6 +217,7 @@ def validate_options(opts):
     validate_positive('autonumber start', opts.autonumber_start)
     validate_positive('autonumber size', opts.autonumber_size, True)
     validate_positive('concurrent fragments', opts.concurrent_fragment_downloads, True)
+    validate_positive('postprocess pipeline workers', opts.postprocess_pipeline_workers)
     validate_positive('playlist start', opts.playliststart, True)
     if opts.playlistend != -1:
         validate_minmax(opts.playliststart, opts.playlistend, 'playlist start', 'playlist end')
@@ -846,6 +847,7 @@ def parse_options(argv=None):
         'skip_unavailable_fragments': opts.skip_unavailable_fragments,
         'keep_fragments': opts.keep_fragments,
         'concurrent_fragment_downloads': opts.concurrent_fragment_downloads,
+        'postprocess_pipeline_workers': opts.postprocess_pipeline_workers,
         'buffersize': opts.buffersize,
         'noresizebuffer': opts.noresizebuffer,
         'http_chunk_size': opts.http_chunk_size,

@@ -905,6 +905,52 @@ class TestYoutubeDL(unittest.TestCase):
         self.assertTrue(os.path.exists(filename), f'{filename} doesn\'t exist')
         os.unlink(filename)
 
+    def test_postprocess_pipeline(self):
+        processed = []
+
+        class PipelinePP(PostProcessor):
+            def run(self, info):
+                processed.append(info['id'])
+                with open(f'{info["filepath"]}.done', 'w') as f:
+                    f.write('DONE')
+                return [], info
+
+        filename = 'postprocess-pipeline-testfile.mp4'
+        archive = 'postprocess-pipeline-archive.txt'
+        info = {
+            'id': 'abc',
+            'extractor': 'test',
+            'extractor_key': 'Test',
+            'filepath': filename,
+        }
+        try:
+            with open(filename, 'w') as f:
+                f.write('VIDEO')
+
+            ydl = YoutubeDL({
+                'quiet': True,
+                'download_archive': archive,
+                'postprocess_pipeline_workers': 1,
+            })
+            ydl.add_post_processor(PipelinePP())
+            event = ydl._enqueue_pipeline_post_process(filename, dict(info), {})
+            ydl._enqueue_pipeline_after_video({
+                **info,
+                'requested_downloads': [{'__write_download_archive': 'ignore'}],
+            }, [event])
+
+            self.assertEqual(processed, [])
+            ydl.wait_postprocess_pipeline()
+
+            self.assertEqual(processed, ['abc'])
+            self.assertTrue(os.path.exists(f'{filename}.done'))
+            with open(archive) as f:
+                self.assertEqual(f.read().strip(), ydl._make_archive_id(info))
+        finally:
+            try_rm(filename)
+            try_rm(f'{filename}.done')
+            try_rm(archive)
+
     def test_match_filter(self):
         first = {
             'id': '1',

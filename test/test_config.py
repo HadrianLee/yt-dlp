@@ -163,6 +163,13 @@ class TestConfig(unittest.TestCase):
         for index, _ in enumerate(make_expected(), 1):
             self._override_test(index)
 
+    def test_postprocess_pipeline_options(self):
+        _, opts, _ = parseOpts(['--use-postprocess-pipeline'], False)
+        self.assertEqual(opts.postprocess_pipeline_workers, 4)
+
+        _, opts, _ = parseOpts(['--postprocess-pipeline-workers', '2'], False)
+        self.assertEqual(opts.postprocess_pipeline_workers, 2)
+
     def _override_test(self, start_index, *args):
         index = 0
 

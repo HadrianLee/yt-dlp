@@ -12,6 +12,7 @@ import json
 import locale
 import operator
 import os
+import queue
 import random
 import re
 import shutil
@@ -19,6 +20,7 @@ import string
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tokenize
 import traceback
@@ -506,6 +508,8 @@ class YoutubeDL:
     force_keyframes_at_cuts: Re-encode the video when downloading ranges to get precise cuts
     noprogress:        Do not print the progress bar
     live_from_start:   Whether to download livestreams videos from the start
+    postprocess_pipeline_workers: Number of background workers used to run
+                       post-processing after each download. Disabled when 0.
     warn_when_outdated: Emit a warning if the yt-dlp version is older than 90 days
 
     The following parameters are not used by YoutubeDL itself, they are used by
@@ -648,6 +652,10 @@ class YoutubeDL:
         self._num_videos = 0
         self._playlist_level = 0
         self._playlist_urls = set()
+        self._postprocess_pipeline_queue = None
+        self._postprocess_pipeline_threads = []
+        self._postprocess_pipeline_sentinel = object()
+        self._postprocess_pipeline_lock = threading.Lock()
         self.cache = Cache(self)
         self.__header_cookies = []
 
@@ -1051,6 +1059,7 @@ class YoutubeDL:
         self.close()
 
     def close(self):
+        self.wait_postprocess_pipeline()
         self.save_cookies()
         if '_request_director' in self.__dict__:
             self._request_director.close()
@@ -3104,13 +3113,20 @@ class YoutubeDL:
                 if max_downloads_reached:
                     break
 
-            write_archive = {f.get('__write_download_archive', False) for f in downloaded_formats}
-            assert write_archive.issubset({True, False, 'ignore'})
-            if True in write_archive and False not in write_archive:
-                self.record_download_archive(info_dict)
-
             info_dict['requested_downloads'] = downloaded_formats
-            info_dict = self.run_all_pps('after_video', info_dict)
+            pipeline_events = []
+            for fmt in downloaded_formats:
+                if event := fmt.pop('__postprocess_pipeline_event', None):
+                    pipeline_events.append(event)
+            if pipeline_events:
+                self._enqueue_pipeline_after_video(info_dict, pipeline_events)
+            else:
+                write_archive = {f.get('__write_download_archive', False) for f in downloaded_formats}
+                assert write_archive.issubset({True, False, 'ignore'})
+                if True in write_archive and False not in write_archive:
+                    self.record_download_archive(info_dict)
+
+                info_dict = self.run_all_pps('after_video', info_dict)
             if max_downloads_reached:
                 raise MaxDownloadsReached
 
@@ -3618,21 +3634,26 @@ class YoutubeDL:
                     ffmpeg_fixup(downloader == 'web_socket_fragment', 'Malformed duration detected', FFmpegFixupDurationPP)
 
                 fixup()
-                try:
-                    replace_info_dict(self.post_process(dl_filename, info_dict, files_to_move))
-                except PostProcessingError as err:
-                    self.report_error(f'Postprocessing: {err}')
-                    return
-                try:
-                    for ph in self._post_hooks:
-                        ph(info_dict['filepath'])
-                except Exception as err:
-                    self.report_error(f'post hooks: {err}')
-                    return
-                info_dict['__write_download_archive'] = True
+                if self._postprocess_pipeline_enabled():
+                    info_dict['__postprocess_pipeline_event'] = self._enqueue_pipeline_post_process(
+                        dl_filename, dict(info_dict), files_to_move)
+                    info_dict['__write_download_archive'] = 'ignore'
+                else:
+                    try:
+                        replace_info_dict(self.post_process(dl_filename, info_dict, files_to_move))
+                    except PostProcessingError as err:
+                        self.report_error(f'Postprocessing: {err}')
+                        return
+                    try:
+                        for ph in self._post_hooks:
+                            ph(info_dict['filepath'])
+                    except Exception as err:
+                        self.report_error(f'post hooks: {err}')
+                        return
+                    info_dict['__write_download_archive'] = True
 
         assert info_dict is original_infodict  # Make sure the info_dict was modified in-place
-        if self.params.get('force_write_download_archive'):
+        if self.params.get('force_write_download_archive') and not info_dict.get('__postprocess_pipeline_event'):
             info_dict['__write_download_archive'] = True
         check_max_downloads()
 
@@ -3670,6 +3691,7 @@ class YoutubeDL:
             self.__download_wrapper(self.extract_info)(
                 url, force_generic_extractor=self.params.get('force_generic_extractor', False))
 
+        self.wait_postprocess_pipeline()
         return self._download_retcode
 
     def download_with_info_file(self, info_filename):
@@ -3692,6 +3714,7 @@ class YoutubeDL:
                 self.download([webpage_url])
             except ExtractorError as e:
                 self.report_error(e)
+        self.wait_postprocess_pipeline()
         return self._download_retcode
 
     @staticmethod
@@ -3759,6 +3782,100 @@ class YoutubeDL:
             info_dict.update(post_extractor())
 
         actual_post_extract(info_dict or {})
+
+    def _postprocess_pipeline_enabled(self):
+        return (self.params.get('postprocess_pipeline_workers') or 0) > 0
+
+    def _ensure_postprocess_pipeline(self):
+        if self._postprocess_pipeline_threads:
+            return
+        self._postprocess_pipeline_queue = queue.Queue()
+        worker_count = self.params.get('postprocess_pipeline_workers') or 0
+        for index in range(worker_count):
+            thread = threading.Thread(
+                target=self._postprocess_pipeline_worker,
+                name=f'yt-dlp-postprocess-{index + 1}',
+                daemon=True)
+            thread.start()
+            self._postprocess_pipeline_threads.append(thread)
+
+    def _postprocess_pipeline_worker(self):
+        while True:
+            item = self._postprocess_pipeline_queue.get()
+            try:
+                if item is self._postprocess_pipeline_sentinel:
+                    return
+                item_type, *args = item
+                if item_type == 'post_process':
+                    self._run_pipeline_post_process(*args)
+                elif item_type == 'after_video':
+                    self._run_pipeline_after_video(*args)
+            finally:
+                self._postprocess_pipeline_queue.task_done()
+
+    def _run_pipeline_post_process(self, event, filename, info, files_to_move):
+        try:
+            new_info = self.post_process(filename, info, files_to_move)
+            for ph in self._post_hooks:
+                ph(new_info['filepath'])
+        except PostProcessingError as err:
+            event.error = f'Postprocessing: {err}'
+            self.report_error(event.error, is_error=False)
+            self._download_retcode = 1
+        except Exception as err:
+            event.error = f'post hooks: {err}'
+            self.report_error(event.error, is_error=False)
+            self._download_retcode = 1
+        else:
+            event.success = True
+        finally:
+            event.set()
+
+    def _run_pipeline_after_video(self, events, info):
+        for event in events:
+            event.wait()
+        if any(getattr(event, 'error', None) for event in events):
+            return
+
+        write_archive = {f.get('__write_download_archive', False) for f in info.get('requested_downloads') or []}
+        write_archive.discard('ignore')
+        if events:
+            write_archive.add(True)
+        assert write_archive.issubset({True, False})
+        if True in write_archive and False not in write_archive:
+            with self._postprocess_pipeline_lock:
+                self.record_download_archive(info)
+
+        try:
+            self.run_all_pps('after_video', info)
+        except PostProcessingError as err:
+            self.report_error(f'Postprocessing: {err}', is_error=False)
+            self._download_retcode = 1
+
+    def _enqueue_pipeline_post_process(self, filename, info, files_to_move):
+        self._ensure_postprocess_pipeline()
+        event = threading.Event()
+        event.success = False
+        event.error = None
+        info['filepath'] = filename
+        info['__files_to_move'] = dict(files_to_move or {})
+        self._postprocess_pipeline_queue.put(('post_process', event, filename, info, dict(files_to_move or {})))
+        return event
+
+    def _enqueue_pipeline_after_video(self, info, events):
+        self._ensure_postprocess_pipeline()
+        self._postprocess_pipeline_queue.put(('after_video', tuple(events), dict(info)))
+
+    def wait_postprocess_pipeline(self):
+        if not self._postprocess_pipeline_threads:
+            return
+        self._postprocess_pipeline_queue.join()
+        for _ in self._postprocess_pipeline_threads:
+            self._postprocess_pipeline_queue.put(self._postprocess_pipeline_sentinel)
+        for thread in self._postprocess_pipeline_threads:
+            thread.join()
+        self._postprocess_pipeline_threads.clear()
+        self._postprocess_pipeline_queue = None
 
     def run_pp(self, pp, infodict):
         files_to_delete = []

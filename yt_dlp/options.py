@@ -1012,6 +1012,14 @@ def create_parser():
         dest='concurrent_fragment_downloads', metavar='N', default=1, type=int,
         help='Number of fragments of a dash/hlsnative video that should be downloaded concurrently (default is %default)')
     downloader.add_option(
+        '--use-postprocess-pipeline',
+        action='store_const', dest='postprocess_pipeline_workers', const=4, default=0,
+        help='Run post-processing in a background producer-consumer pipeline with 4 worker threads')
+    downloader.add_option(
+        '--postprocess-pipeline-workers',
+        dest='postprocess_pipeline_workers', metavar='N', type=int,
+        help='Number of background workers to use with --use-postprocess-pipeline')
+    downloader.add_option(
         '-r', '--limit-rate', '--rate-limit',
         dest='ratelimit', metavar='RATE',
         help='Maximum download rate in bytes per second, e.g. 50K or 4.2M')
